@@ -12,11 +12,15 @@ import UIKit
 struct ContentView: View {
     @State private var viewModel = ViewModel()
     @State private var nfcReader = NFCReader()
+    @State private var backgroundAudioManager = BackgroundAlarmAudioManager()
+    @State private var hapticManager = HapticAlarmManager()
     @State private var showAddSheet = false
     @State private var showNFCScanning = false
     @State private var showAlarmRinging = false
     @State private var currentAlertingAlarm: (UUID, WakyAlarmData)?
     @State private var showAuthorizationAlert = false
+    @State private var showLowVolumeWarning = false
+    @State private var currentVolume: Float = 0.0
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -37,10 +41,17 @@ struct ContentView: View {
         .onAppear {
             viewModel.fetchAlarms()
             checkAuthorizationStatus()
+
+            // Check for active alarm state (in case app was force-killed)
+            checkForActiveAlarmState()
+
             // Delay NFC check to ensure app is fully in foreground
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 checkForAlertingAlarms()
             }
+
+            // Setup notification observers
+            setupNotificationObservers()
         }
         .onChange(of: viewModel.alertingAlarms.count) {
             // Delay NFC check to ensure app is ready
@@ -53,8 +64,18 @@ struct ContentView: View {
                 // App came to foreground - fetch alarms and check for alerting ones
                 print("App became active - fetching alarms")
                 viewModel.fetchAlarms()
+
+                // Check if we need to resume alarm after force-kill
+                checkForActiveAlarmState()
+
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     checkForAlertingAlarms()
+                }
+            } else if newPhase == .background {
+                print("App moved to background")
+                // Audio should keep playing in background
+                if backgroundAudioManager.isPlaying {
+                    print("✅ Background audio is playing - will continue in background")
                 }
             }
         }
@@ -63,6 +84,8 @@ struct ContentView: View {
             if showAlarmRinging {
                 AlarmRingingView(
                     isScanning: showNFCScanning,
+                    showLowVolumeWarning: showLowVolumeWarning,
+                    currentVolume: currentVolume,
                     onScanNFC: {
                         if let (alarmID, metadata) = currentAlertingAlarm {
                             showNFCScanning = true
@@ -175,12 +198,16 @@ struct ContentView: View {
                 print("✅ NFC scan successful! Stopping ALL alarms and hiding screen.")
                 viewModel.stopAlarmWithNFC(alarmID: alarmID)
 
+                // Stop background audio and haptics
+                stopBackgroundAlarm()
+
                 // Wait a bit then hide the alarm screen
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                     withAnimation {
                         showNFCScanning = false
                         showAlarmRinging = false
                         currentAlertingAlarm = nil
+                        showLowVolumeWarning = false
                     }
                     print("🎉 Alarm screen hidden - all alarms stopped!")
                 }
@@ -189,6 +216,104 @@ struct ContentView: View {
                 showNFCScanning = false
                 // Keep alarm ringing screen visible
             }
+        }
+    }
+
+    func setupNotificationObservers() {
+        // Listen for background alarm start request
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("StartBackgroundAlarm"),
+            object: nil,
+            queue: .main
+        ) { notification in
+            print("🔔 Received StartBackgroundAlarm notification")
+
+            if let userInfo = notification.userInfo,
+               let alarmID = userInfo["alarmID"] as? String,
+               let nfcTagID = userInfo["nfcTagID"] as? String {
+                print("📋 Alarm ID: \(alarmID), NFC Tag: \(nfcTagID)")
+
+                // Start background audio
+                startBackgroundAlarm(alarmID: alarmID, nfcTagID: nfcTagID)
+            }
+        }
+
+        // Listen for low volume warnings
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("LowVolumeWarning"),
+            object: nil,
+            queue: .main
+        ) { notification in
+            if let userInfo = notification.userInfo,
+               let volume = userInfo["volume"] as? Float {
+                print("⚠️ Low volume warning: \(Int(volume * 100))%")
+                currentVolume = volume
+                showLowVolumeWarning = true
+
+                // Hide warning after 5 seconds
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                    showLowVolumeWarning = false
+                }
+            }
+        }
+    }
+
+    func startBackgroundAlarm(alarmID: String, nfcTagID: String) {
+        print("🎵 Starting background alarm...")
+
+        // Save alarm state for persistence (in case app is killed)
+        AlarmStateManager.shared.saveActiveAlarm(alarmID: alarmID, nfcTagID: nfcTagID)
+
+        // Show alarm ringing screen if not already visible
+        if !showAlarmRinging {
+            // Store alarm info
+            if let uuid = UUID(uuidString: alarmID) {
+                currentAlertingAlarm = (uuid, WakyAlarmData(nfcTagID: nfcTagID))
+            }
+
+            withAnimation {
+                showAlarmRinging = true
+            }
+        }
+
+        // Start background audio
+        do {
+            try backgroundAudioManager.startBackgroundAlarm()
+            print("✅ Background audio started")
+        } catch {
+            print("❌ Failed to start background audio: \(error)")
+        }
+
+        // Start haptic feedback
+        hapticManager.startContinuousVibration()
+        print("✅ Haptic feedback started")
+    }
+
+    func stopBackgroundAlarm() {
+        print("🛑 Stopping background alarm...")
+        backgroundAudioManager.stopAlarm()
+        hapticManager.stopVibration()
+
+        // Clear persisted alarm state
+        AlarmStateManager.shared.clearActiveAlarm()
+
+        print("✅ Background alarm stopped")
+    }
+
+    func checkForActiveAlarmState() {
+        print("🔍 Checking for active alarm state...")
+
+        // Check if there's a persisted alarm that needs to be resumed
+        if let activeAlarm = AlarmStateManager.shared.getActiveAlarm() {
+            print("🔄 Found active alarm - resuming: \(activeAlarm.alarmID)")
+
+            // Resume the alarm
+            startBackgroundAlarm(alarmID: activeAlarm.alarmID, nfcTagID: activeAlarm.nfcTagID)
+
+            // Show message to user
+            print("✅ Alarm resumed after app restart")
+        } else {
+            print("ℹ️ No active alarm state found")
         }
     }
 }
@@ -338,6 +463,8 @@ struct AlarmAddView: View {
 // Alarm Ringing Screen - Shows when alarm is alerting
 struct AlarmRingingView: View {
     var isScanning: Bool
+    var showLowVolumeWarning: Bool
+    var currentVolume: Float
     var onScanNFC: () -> Void
     @Bindable var nfcReader: NFCReader
     @State private var animationAmount: CGFloat = 1.0
@@ -388,6 +515,32 @@ struct AlarmRingingView: View {
                     Text("Scan your NFC tag to stop")
                         .font(.title3)
                         .foregroundStyle(.white.opacity(0.9))
+                }
+
+                // Low volume warning
+                if showLowVolumeWarning {
+                    VStack(spacing: 8) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "speaker.wave.1.fill")
+                                .font(.title3)
+                            Text("Volume is Low!")
+                                .font(.headline)
+                        }
+                        .foregroundStyle(.white)
+
+                        Text("Volume: \(Int(currentVolume * 100))%")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.9))
+
+                        Text("Please turn up volume to ensure you hear the alarm")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.8))
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding()
+                    .background(Color.black.opacity(0.3))
+                    .cornerRadius(12)
+                    .transition(.scale.combined(with: .opacity))
                 }
 
                 Spacer()

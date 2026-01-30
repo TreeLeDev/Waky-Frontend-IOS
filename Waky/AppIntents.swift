@@ -10,15 +10,41 @@ import AppIntents
 import SwiftUI
 
 // Intent that opens the app for NFC scanning
-// When Stop is tapped, this reschedules the alarm to ring again in 3 seconds
-// Creating a "persistent alarm" that keeps coming back until NFC is scanned
+// When Stop is tapped, AlarmKit dismisses but we use TWO strategies:
+// 1. Start background audio (continues while app is alive)
+// 2. Schedule backup AlarmKit alarm (in case app is killed)
 struct NFCStopIntent: LiveActivityIntent {
     func perform() throws -> some IntentResult {
-        // Schedule a new alarm to ring in 3 seconds (alarm will "restart")
-        let threeSecondsFromNow = Date.now.addingTimeInterval(3)
+        print("🎯 NFCStopIntent triggered - starting persistent alarm...")
+
+        // STRATEGY 1: Post notification to start background audio
+        // This works great while app is alive (backgrounded or foreground)
+        NotificationCenter.default.post(
+            name: NSNotification.Name("StartBackgroundAlarm"),
+            object: nil,
+            userInfo: [
+                "alarmID": alarmID,
+                "nfcTagID": nfcTagID,
+                "timestamp": Date().timeIntervalSince1970
+            ]
+        )
+        print("✅ Background alarm notification posted")
+
+        // STRATEGY 2: Schedule backup AlarmKit alarm for 5 seconds later
+        // This serves as a fallback if the app is force-killed
+        // When this alarm rings, it will reopen the app and resume background audio
+        scheduleBackupAlarm()
+
+        return .result()
+    }
+
+    private func scheduleBackupAlarm() {
+        print("⏰ Scheduling backup AlarmKit alarm...")
+
+        let fiveSecondsFromNow = Date.now.addingTimeInterval(5)
         let time = Alarm.Schedule.Relative.Time(
-            hour: Calendar.current.component(.hour, from: threeSecondsFromNow),
-            minute: Calendar.current.component(.minute, from: threeSecondsFromNow)
+            hour: Calendar.current.component(.hour, from: fiveSecondsFromNow),
+            minute: Calendar.current.component(.minute, from: fiveSecondsFromNow)
         )
         let schedule = Alarm.Schedule.relative(.init(time: time))
 
@@ -36,17 +62,20 @@ struct NFCStopIntent: LiveActivityIntent {
             stopIntent: NFCStopIntent(alarmID: newID.uuidString, nfcTagID: nfcTagID)
         )
 
-        // Schedule the new alarm (keeps alarm ringing)
+        // Schedule the backup alarm asynchronously
         Task {
-            _ = try? await AlarmManager.shared.schedule(id: newID, configuration: alarmConfiguration)
+            do {
+                let alarm = try await AlarmManager.shared.schedule(id: newID, configuration: alarmConfiguration)
+                print("✅ Backup AlarmKit alarm scheduled: \(alarm.id)")
+            } catch {
+                print("❌ Failed to schedule backup alarm: \(error)")
+            }
         }
-
-        return .result()
     }
 
     static var title: LocalizedStringResource = "Stop"
-    static var description = IntentDescription("Opens app for NFC verification (alarm continues)")
-    static var openAppWhenRun = true
+    static var description = IntentDescription("Opens app for NFC verification (alarm continues with background audio)")
+    static var openAppWhenRun = true  // Opens app to background/foreground
 
     @Parameter(title: "alarmID")
     var alarmID: String
