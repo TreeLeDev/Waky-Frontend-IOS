@@ -7,18 +7,46 @@
 
 import AlarmKit
 import AppIntents
+import SwiftUI
 
-// Intent that opens the app for NFC scanning (does not stop alarm until NFC is scanned)
+// Intent that opens the app for NFC scanning
+// When Stop is tapped, this reschedules the alarm to ring again in 3 seconds
+// Creating a "persistent alarm" that keeps coming back until NFC is scanned
 struct NFCStopIntent: LiveActivityIntent {
     func perform() throws -> some IntentResult {
-        // This intent opens the app but does NOT stop the alarm
-        // The alarm will only be stopped after successful NFC scan in the app
+        // Schedule a new alarm to ring in 3 seconds (alarm will "restart")
+        let threeSecondsFromNow = Date.now.addingTimeInterval(3)
+        let time = Alarm.Schedule.Relative.Time(
+            hour: Calendar.current.component(.hour, from: threeSecondsFromNow),
+            minute: Calendar.current.component(.minute, from: threeSecondsFromNow)
+        )
+        let schedule = Alarm.Schedule.relative(.init(time: time))
+
+        let alertContent = AlarmPresentation.Alert(title: "Scan NFC to Stop!")
+        let attributes = AlarmAttributes(
+            presentation: AlarmPresentation(alert: alertContent),
+            metadata: WakyAlarmData(nfcTagID: nfcTagID),
+            tintColor: .red  // Red to indicate persistent alarm
+        )
+
+        let newID = UUID()
+        let alarmConfiguration = AlarmManager.AlarmConfiguration(
+            schedule: schedule,
+            attributes: attributes,
+            stopIntent: NFCStopIntent(alarmID: newID.uuidString, nfcTagID: nfcTagID)
+        )
+
+        // Schedule the new alarm (keeps alarm ringing)
+        Task {
+            _ = try? await AlarmManager.shared.schedule(id: newID, configuration: alarmConfiguration)
+        }
+
         return .result()
     }
 
-    static var title: LocalizedStringResource = "Scan NFC to Stop"
-    static var description = IntentDescription("Opens the app to scan NFC tag for alarm dismissal")
-    static var openAppWhenRun = true  // This is the key - it opens the app
+    static var title: LocalizedStringResource = "Stop"
+    static var description = IntentDescription("Opens app for NFC verification (alarm continues)")
+    static var openAppWhenRun = true
 
     @Parameter(title: "alarmID")
     var alarmID: String

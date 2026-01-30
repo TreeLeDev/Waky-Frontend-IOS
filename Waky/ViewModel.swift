@@ -54,7 +54,7 @@ import AppIntents
         let schedule = Alarm.Schedule.relative(.init(time: time))
         print("Test alarm schedule: \(schedule)")
 
-        // Use simple title-only initializer (non-deprecated)
+        // System stop button will trigger NFCStopIntent (opens app, doesn't stop alarm)
         let alertContent = AlarmPresentation.Alert(title: "Test Alarm")
 
         let metadata = WakyAlarmData()
@@ -119,8 +119,18 @@ import AppIntents
 
     func stopAlarmWithNFC(alarmID: UUID) {
         do {
+            // Stop the current alarm
             try alarmManager.stop(id: alarmID)
             print("Alarm \(alarmID) stopped successfully")
+
+            // CRITICAL: Stop ALL alerting alarms to prevent persistent alarm from rescheduling
+            let allAlarms = try? alarmManager.alarms
+            allAlarms?.forEach { alarm in
+                if alarm.state == .alerting || alarm.state == .scheduled {
+                    try? alarmManager.cancel(id: alarm.id)
+                    print("Cancelled persistent alarm: \(alarm.id)")
+                }
+            }
         } catch {
             print("Error stopping alarm: \(error)")
         }
@@ -163,7 +173,9 @@ import AppIntents
     }
 
     private func alarmPresentation(with userInput: AlarmForm) -> AlarmPresentation {
-        // Use simple title-only initializer (iOS 26.1+ non-deprecated API)
+        // iOS 26.1+ uses system stop button, but we control behavior via stopIntent
+        // When user taps "Stop", NFCStopIntent opens app without stopping alarm
+        // Alarm only stops after successful NFC scan
         let alertContent = AlarmPresentation.Alert(title: userInput.localizedLabel)
         return AlarmPresentation(alert: alertContent)
     }
@@ -183,9 +195,10 @@ import AppIntents
                 if let existing = alarmsMap[updated.id] {
                     alarmsMap[updated.id] = (updated, existing.1, existing.2)
                 } else {
-                    // New alarm from a previous session
-                    let defaultMetadata = WakyAlarmData()
-                    alarmsMap[updated.id] = (updated, "Alarm (Old Session)", defaultMetadata)
+                    // New alarm from persistent alarm - use default NFC tag
+                    let metadata = WakyAlarmData(nfcTagID: "0455B45F396180")
+                    alarmsMap[updated.id] = (updated, "Scan NFC to Stop!", metadata)
+                    print("Added persistent alarm to map: \(updated.id)")
                 }
             }
 

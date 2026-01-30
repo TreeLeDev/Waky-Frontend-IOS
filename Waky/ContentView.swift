@@ -14,34 +14,64 @@ struct ContentView: View {
     @State private var nfcReader = NFCReader()
     @State private var showAddSheet = false
     @State private var showNFCScanning = false
+    @State private var showAlarmRinging = false
+    @State private var currentAlertingAlarm: (UUID, WakyAlarmData)?
     @State private var showAuthorizationAlert = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        NavigationStack {
-            content
-                .navigationTitle("Waky")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    addButton
-                }
-        }
-        .sheet(isPresented: $showAddSheet) {
-            AlarmAddView()
-        }
-        .environment(viewModel)
+        ZStack {
+            // Main app content
+            NavigationStack {
+                content
+                    .navigationTitle("Waky")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        addButton
+                    }
+            }
+            .sheet(isPresented: $showAddSheet) {
+                AlarmAddView()
+            }
+            .environment(viewModel)
         .onAppear {
             viewModel.fetchAlarms()
-            checkForAlertingAlarms()
             checkAuthorizationStatus()
+            // Delay NFC check to ensure app is fully in foreground
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                checkForAlertingAlarms()
+            }
         }
         .onChange(of: viewModel.alertingAlarms.count) {
-            checkForAlertingAlarms()
+            // Delay NFC check to ensure app is ready
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                checkForAlertingAlarms()
+            }
         }
-        .overlay {
-            if showNFCScanning {
-                NFCScanView(nfcReader: nfcReader, onDismiss: {
-                    showNFCScanning = false
-                })
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase == .active {
+                // App came to foreground - fetch alarms and check for alerting ones
+                print("App became active - fetching alarms")
+                viewModel.fetchAlarms()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    checkForAlertingAlarms()
+                }
+            }
+        }
+
+            // Alarm ringing screen (full screen overlay)
+            if showAlarmRinging {
+                AlarmRingingView(
+                    isScanning: showNFCScanning,
+                    onScanNFC: {
+                        if let (alarmID, metadata) = currentAlertingAlarm {
+                            showNFCScanning = true
+                            startNFCScan(alarmID: alarmID, expectedTagID: metadata.nfcTagID)
+                        }
+                    },
+                    nfcReader: nfcReader
+                )
+                .transition(.move(edge: .bottom))
             }
         }
         .alert("AlarmKit Authorization", isPresented: $showAuthorizationAlert) {
@@ -113,22 +143,51 @@ struct ContentView: View {
 
     func checkForAlertingAlarms() {
         let alerting = viewModel.alertingAlarms
-        if !alerting.isEmpty && !showNFCScanning {
-            // Automatically prompt NFC scan when alarm is alerting
-            if let (alarmID, _, metadata) = alerting.first {
-                showNFCScanning = true
-                startNFCScan(alarmID: alarmID, expectedTagID: metadata.nfcTagID)
+        print("🔍 Checking for alerting alarms: count = \(alerting.count)")
+        print("🔍 showAlarmRinging = \(showAlarmRinging)")
+
+        if !alerting.isEmpty {
+            print("✅ Found \(alerting.count) alerting alarm(s)")
+            if let (alarmID, alarm, metadata) = alerting.first {
+                print("🚨 Alarm is alerting: \(alarmID)")
+                print("🚨 Alarm state: \(alarm.state)")
+                print("🚨 Expected NFC tag: \(metadata.nfcTagID)")
+
+                // Store current alerting alarm and show the ringing screen
+                currentAlertingAlarm = (alarmID, metadata)
+                withAnimation {
+                    showAlarmRinging = true
+                }
             }
+        } else {
+            print("⏸️ No alerting alarms found")
+            // DON'T hide the screen immediately - persistent alarm will ring in 3 seconds
+            // Only hide if user successfully scanned NFC (handled in startNFCScan)
+            // Keep the screen visible during the gap between persistent alarms
+            print("⏳ Keeping alarm screen visible - waiting for persistent alarm...")
         }
     }
 
     func startNFCScan(alarmID: UUID, expectedTagID: String) {
+        print("📱 Starting NFC scan session...")
         nfcReader.startScanning(expectedTagID: expectedTagID) { success in
             if success {
+                print("✅ NFC scan successful! Stopping ALL alarms and hiding screen.")
                 viewModel.stopAlarmWithNFC(alarmID: alarmID)
+
+                // Wait a bit then hide the alarm screen
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    showNFCScanning = false
+                    withAnimation {
+                        showNFCScanning = false
+                        showAlarmRinging = false
+                        currentAlertingAlarm = nil
+                    }
+                    print("🎉 Alarm screen hidden - all alarms stopped!")
                 }
+            } else {
+                print("❌ NFC scan failed - keeping screen visible")
+                showNFCScanning = false
+                // Keep alarm ringing screen visible
             }
         }
     }
@@ -276,59 +335,124 @@ struct AlarmAddView: View {
     }
 }
 
-struct NFCScanView: View {
+// Alarm Ringing Screen - Shows when alarm is alerting
+struct AlarmRingingView: View {
+    var isScanning: Bool
+    var onScanNFC: () -> Void
     @Bindable var nfcReader: NFCReader
-    var onDismiss: () -> Void
+    @State private var animationAmount: CGFloat = 1.0
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.8)
-                .ignoresSafeArea()
+            // Background
+            LinearGradient(
+                colors: [Color.red.opacity(0.9), Color.orange.opacity(0.9)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
 
-            VStack(spacing: 30) {
-                Image(systemName: "sensor.tag.radiowaves.forward.fill")
-                    .font(.system(size: 80))
-                    .foregroundStyle(.orange)
-                    .symbolEffect(.variableColor.iterative, options: .repeating)
+            VStack(spacing: 40) {
+                Spacer()
 
-                VStack(spacing: 10) {
-                    Text("Scan NFC Tag to Stop Alarm")
-                        .font(.title2.bold())
+                // Audio waveform animation
+                HStack(spacing: 8) {
+                    ForEach(0..<5, id: \.self) { index in
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(.white)
+                            .frame(width: 8, height: waveHeight(for: index))
+                            .animation(
+                                .easeInOut(duration: 0.5)
+                                .repeatForever(autoreverses: true)
+                                .delay(Double(index) * 0.1),
+                                value: animationAmount
+                            )
+                    }
+                }
+                .frame(height: 100)
+                .onAppear {
+                    animationAmount = 2.0
+                }
+
+                // Alarm message
+                VStack(spacing: 12) {
+                    Image(systemName: "alarm.fill")
+                        .font(.system(size: 60))
+                        .foregroundStyle(.white)
+                        .symbolEffect(.pulse)
+
+                    Text("Alarm Ringing!")
+                        .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(.white)
 
-                    Text("Hold your iPhone near the NFC tag")
-                        .font(.body)
-                        .foregroundStyle(.white.opacity(0.7))
+                    Text("Scan your NFC tag to stop")
+                        .font(.title3)
+                        .foregroundStyle(.white.opacity(0.9))
                 }
 
-                if let error = nfcReader.errorMessage {
-                    Text(error)
-                        .font(.caption)
+                Spacer()
+
+                // NFC scanning interface or button
+                if isScanning {
+                    // Show NFC scanning UI
+                    VStack(spacing: 24) {
+                        Image(systemName: "sensor.tag.radiowaves.forward.fill")
+                            .font(.system(size: 80))
+                            .foregroundStyle(.white)
+                            .symbolEffect(.variableColor.iterative, options: .repeating)
+
+                        Text("Hold your iPhone near the NFC tag")
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+
+                        if nfcReader.isScanning {
+                            ProgressView()
+                                .tint(.white)
+                                .scaleEffect(1.5)
+                        }
+
+                        if let error = nfcReader.errorMessage {
+                            Text(error)
+                                .font(.body)
+                                .foregroundStyle(.white)
+                                .padding()
+                                .background(Color.black.opacity(0.3))
+                                .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal, 40)
+                } else {
+                    // Show "Scan NFC" button
+                    Button(action: onScanNFC) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "sensor.tag.radiowaves.forward.fill")
+                                .font(.title2)
+                            Text("Scan NFC to Stop Alarm")
+                                .font(.title2.bold())
+                        }
                         .foregroundStyle(.red)
-                        .padding()
-                        .background(Color.white.opacity(0.1))
-                        .cornerRadius(10)
+                        .padding(.horizontal, 40)
+                        .padding(.vertical, 20)
+                        .background(.white)
+                        .cornerRadius(16)
+                        .shadow(color: .black.opacity(0.3), radius: 10, y: 5)
+                    }
+                    .scaleEffect(animationAmount / 2)
+                    .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: animationAmount)
                 }
 
-                if nfcReader.isScanning {
-                    ProgressView()
-                        .tint(.orange)
-                        .scaleEffect(1.5)
-                }
-
-                Button("Cancel") {
-                    nfcReader.stopScanning()
-                    onDismiss()
-                }
-                .font(.headline)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 30)
-                .padding(.vertical, 12)
-                .background(Color.red)
-                .cornerRadius(10)
+                Spacer()
             }
             .padding(40)
         }
+    }
+
+    private func waveHeight(for index: Int) -> CGFloat {
+        let baseHeight: CGFloat = 20
+        let maxHeight: CGFloat = 100
+        let heights: [CGFloat] = [0.3, 0.7, 1.0, 0.7, 0.3]
+        return baseHeight + (maxHeight - baseHeight) * heights[index] * (animationAmount / 2)
     }
 }
 
